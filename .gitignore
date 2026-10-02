@@ -1,0 +1,6 @@
+/sampling-server
+*.test
+*.out
+coverage.txt
+/tmp/
+.DS_Store

@@ -1,0 +1,7 @@
+*.out
+*.test
+/tmp/
+.git/
+.DS_Store
+README*.md
+docs/
