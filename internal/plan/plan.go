@@ -5,6 +5,7 @@ package plan
 import (
 	"fmt"
 	"math"
+	"time"
 )
 
 // Kind selects between single and double sampling.
@@ -56,6 +57,12 @@ type Plan struct {
 	N2 int
 	// C2 applies to the combined two-stage defect count.
 	C2 int
+
+	// RevisionNo / RevisionEffectiveAt are populated when this Plan was
+	// loaded as a specific revision (revision history). They are zero on
+	// the "current effective plan" object and on freshly built plans.
+	RevisionNo          int       `json:"revision_no,omitempty"`
+	RevisionEffectiveAt time.Time `json:"revision_effective_at,omitempty"`
 }
 
 // SingleParam is the create/update payload for a single plan.

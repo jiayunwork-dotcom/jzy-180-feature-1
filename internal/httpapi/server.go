@@ -43,6 +43,9 @@ func NewServer(st *store.Store) *Server {
 	pl.GET("/:id", s.getPlan)
 	pl.PUT("/:id", s.updatePlan)
 	pl.DELETE("/:id", s.deletePlan)
+	pl.POST("/:id/revisions", s.appendRevision)
+	pl.GET("/:id/revisions", s.listRevisions)
+	pl.GET("/:id/revisions/:no", s.getRevision)
 
 	pl.POST("/:id/evaluate", s.evaluate)
 	pl.POST("/:id/curve", s.curve)

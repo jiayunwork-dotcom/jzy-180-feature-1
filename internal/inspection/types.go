@@ -62,10 +62,38 @@ type Event struct {
 	Resume bool
 }
 
-// Ref binds a plan slot to a stored plan.
+// Ref binds a plan slot to a stored plan's revision history.
+//
+// Revisions are ordered by (effective_at, revision_no), both ascending.
+// At is the resolution rule shared by the whole package: the revision in
+// force for an inspection at time t is the last revision whose
+// EffectiveAt <= t, with the highest revision number winning ties. The
+// single-Plan field is retained as the degenerate history (tests build a
+// stream without touching revision lists).
 type Ref struct {
-	ID   string
-	Plan *plan.Plan
+	ID        string
+	Plan      *plan.Plan
+	Revisions []plan.Revision
+}
+
+// At returns the parameter set in force for an inspection at t, tagged
+// with its revision number. A one-element (or empty) history resolves to
+// that sole plan.
+func (r Ref) At(t time.Time) (*plan.Plan, int) {
+	if len(r.Revisions) == 0 {
+		return r.Plan, 0
+	}
+	chosen := r.Revisions[0]
+	for _, rv := range r.Revisions[1:] {
+		// Ordered ascending; later revision wins when EffectiveAt is
+		// equal to (or before) t.
+		if !rv.EffectiveAt.After(t) {
+			chosen = rv
+		} else {
+			break
+		}
+	}
+	return chosen.Plan, chosen.No
 }
 
 // Stream binds the three severity plans.
@@ -102,12 +130,16 @@ type BatchOutcome struct {
 	Severity Severity  `json:"severity"`
 	PlanID   string    `json:"plan_id"`
 	PlanName string    `json:"plan_name"`
-	Decision Decision  `json:"decision"`
-	Accepted bool      `json:"accepted"`
-	D1       int       `json:"d1"`
-	D2       *int      `json:"d2,omitempty"`
-	Score    int       `json:"score"`
-	Note     string    `json:"note,omitempty"`
+	// RevisionNo is the revision in force for the bound severity slot at
+	// At. It is nil for suspended, not-inspected lots (no revision was
+	// consulted) and for pre-revision-history migrated rows.
+	RevisionNo *int     `json:"revision_no,omitempty"`
+	Decision   Decision `json:"decision"`
+	Accepted   bool     `json:"accepted"`
+	D1         int      `json:"d1"`
+	D2         *int     `json:"d2,omitempty"`
+	Score      int      `json:"score"`
+	Note       string   `json:"note,omitempty"`
 }
 
 // Snapshot is the current stream state plus every per-batch outcome.

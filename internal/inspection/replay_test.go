@@ -176,9 +176,16 @@ func snapshotsEqual(a, b Snapshot) bool {
 	for i := range a.Batches {
 		x, y := a.Batches[i], b.Batches[i]
 		if x.BatchID != y.BatchID || x.Severity != y.Severity ||
-			x.PlanID != y.PlanID || x.Decision != y.Decision ||
+			x.PlanID != y.PlanID || x.PlanName != y.PlanName ||
+			x.Decision != y.Decision ||
 			x.Accepted != y.Accepted || x.Score != y.Score ||
 			!x.At.Equal(y.At) || x.D1 != y.D1 {
+			return false
+		}
+		if (x.RevisionNo == nil) != (y.RevisionNo == nil) {
+			return false
+		}
+		if x.RevisionNo != nil && *x.RevisionNo != *y.RevisionNo {
 			return false
 		}
 		if (x.D2 == nil) != (y.D2 == nil) {

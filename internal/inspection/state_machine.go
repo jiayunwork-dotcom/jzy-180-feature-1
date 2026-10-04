@@ -59,7 +59,12 @@ type stepResult struct {
 // applyBatch advances the state by one lot. The incoming state is not
 // mutated; the returned state and outcome describe the world after the
 // lot. Determinism across replays comes entirely from this function.
-func applyBatch(st State, s *Stream, b *BatchInput) (State, stepResult) {
+//
+// When strict is true, a lot that cannot be judged under the revision in
+// force for its (severity, inspection time) (e.g. d1 exceeds that
+// revision's sample size) returns a BatchConflict instead of being
+// silently accepted/rejected.
+func applyBatch(st State, s *Stream, b *BatchInput, strict bool) (State, stepResult, *BatchConflict) {
 	st = cloneState(st)
 	res := stepResult{outcome: BatchOutcome{
 		BatchID: b.ID, LotNo: b.LotNo, At: b.At, D1: b.D1, Score: st.Score,
@@ -70,19 +75,42 @@ func applyBatch(st State, s *Stream, b *BatchInput) (State, stepResult) {
 	}
 
 	if st.Severity == SeveritySuspended {
+		// The lot is not judged, so no revision is consulted
+		// (RevisionNo stays nil), but the outcome still names the plan
+		// bound to the current severity slot for traceability.
+		ref := s.planFor(st.Severity)
 		res.outcome.Severity = SeveritySuspended
+		res.outcome.PlanID = ref.ID
+		if ref.Plan != nil {
+			res.outcome.PlanName = ref.Plan.Name
+		}
 		res.outcome.Decision = DecisionNotInspected
 		res.outcome.Accepted = false
 		res.note = "inspection suspended; lot not inspected"
-		return st, res
+		return st, res, nil
 	}
 
 	ref := s.planFor(st.Severity)
-	pl := ref.Plan
+	pl, revNo := ref.At(b.At)
+	if revNo > 0 {
+		n := revNo
+		res.outcome.RevisionNo = &n
+	}
 	res.outcome.Severity = st.Severity
 	res.outcome.PlanID = ref.ID
 	res.outcome.PlanName = pl.Name
 
+	if _, err := LotDecision(pl, b.D1, b.HasD2, b.D2); err != nil {
+		if strict {
+			return st, res, &BatchConflict{
+				BatchID: b.ID, LotNo: b.LotNo, At: b.At,
+				Severity:   st.Severity,
+				PlanID:     ref.ID,
+				RevisionNo: revNo,
+				Reason:     err.Error(),
+			}
+		}
+	}
 	accepted, err := LotDecision(pl, b.D1, b.HasD2, b.D2)
 	if err != nil {
 		// Caller validates before replay; keep the stream defensible.
@@ -119,14 +147,14 @@ func applyBatch(st State, s *Stream, b *BatchInput) (State, stepResult) {
 			st.tightenedAcceptedRun = 0
 			st.tightenedRejectTotal = 0
 			res.note = "switch normal -> tightened"
-			return st, res
+			return st, res, nil
 		}
 		if st.Score >= 30 && st.stable && st.approved {
 			// Score threshold plus both prerequisites -> reduced.
 			st.Severity = SeverityReduced
 			st.Score = 0
 			res.note = "switch normal -> reduced"
-			return st, res
+			return st, res, nil
 		}
 
 	case SeverityTightened:
@@ -162,7 +190,7 @@ func applyBatch(st State, s *Stream, b *BatchInput) (State, stepResult) {
 			res.note = "switch reduced -> normal"
 		}
 	}
-	return st, res
+	return st, res, nil
 }
 
 func rejectsInWindow(w []bool) int {
@@ -175,36 +203,53 @@ func rejectsInWindow(w []bool) int {
 	return r
 }
 
-// validateBatch checks a recorded lot against every plan bound to the
-// stream, since backdated data may be judged under any severity slot.
+// validateBatch checks a recorded lot against exactly the parameter set
+// that could judge it: for each severity slot, the revision EFFECTIVE AT
+// THE LOT'S INSPECTION TIME. (A back-dated lot whose own period used a
+// larger sample size must be accepted even if a later revision shrank
+// it.) Whether a lot ultimately lands on the normal, tightened or
+// reduced slot is decided by the replay, so all three in-force revisions
+// are candidates; a suspended lot is not judged at all.
 func validateBatch(s *Stream, b *BatchInput) error {
 	for _, ref := range []Ref{s.Normal, s.Tightened, s.Reduced} {
-		if ref.Plan == nil {
+		var pl *plan.Plan
+		if len(ref.Revisions) == 0 {
+			pl = ref.Plan
+		} else {
+			pl, _ = ref.At(b.At)
+		}
+		if pl == nil {
 			continue
 		}
-		pl := ref.Plan
-		if pl.Kind == plan.KindSingle {
-			if b.HasD2 {
-				return fieldErr("d2", "not allowed for a single-sampling plan")
-			}
-			if b.D1 < 0 || b.D1 > pl.SampleSize {
-				return fieldErr("d1", "must be within [0,n]")
-			}
-			continue
+		if err := validateBatchAgainst(pl, b); err != nil {
+			return err
 		}
-		if b.D1 < 0 || b.D1 > pl.N1 {
-			return fieldErr("d1", "must be within [0,n1]")
-		}
+	}
+	return nil
+}
+
+func validateBatchAgainst(pl *plan.Plan, b *BatchInput) error {
+	if pl.Kind == plan.KindSingle {
 		if b.HasD2 {
-			if b.D2 < 0 || b.D2 > pl.N2 {
-				return fieldErr("d2", "must be within [0,n2]")
-			}
-			if b.D1+b.D2 > pl.N1+pl.N2 {
-				return fieldErr("d2", "d1+d2 must be within [0,n1+n2]")
-			}
-		} else if b.D1 > pl.C1 && b.D1 < pl.R1 {
-			return fieldErr("d2", "required when c1 < d1 < r1")
+			return fieldErr("d2", "not allowed for a single-sampling plan")
 		}
+		if b.D1 < 0 || b.D1 > pl.SampleSize {
+			return fieldErr("d1", "must be within [0,n]")
+		}
+		return nil
+	}
+	if b.D1 < 0 || b.D1 > pl.N1 {
+		return fieldErr("d1", "must be within [0,n1]")
+	}
+	if b.HasD2 {
+		if b.D2 < 0 || b.D2 > pl.N2 {
+			return fieldErr("d2", "must be within [0,n2]")
+		}
+		if b.D1+b.D2 > pl.N1+pl.N2 {
+			return fieldErr("d2", "d1+d2 must be within [0,n1+n2]")
+		}
+	} else if b.D1 > pl.C1 && b.D1 < pl.R1 {
+		return fieldErr("d2", "required when c1 < d1 < r1")
 	}
 	return nil
 }

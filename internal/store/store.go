@@ -66,11 +66,15 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // stream id. Advisory locks never conflict between different streams and
 // are released automatically at COMMIT/ROLLBACK.
 func lockStream(ctx context.Context, tx pgx.Tx, streamID string) error {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(streamID))
-	key := int64(h.Sum64())
-	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", key)
+	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", fnvHash(streamID))
 	return err
+}
+
+// fnvHash maps an arbitrary key to a signed 64-bit advisory-lock key.
+func fnvHash(key string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key))
+	return int64(h.Sum64())
 }
 
 // runTx executes fn in a transaction.

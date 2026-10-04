@@ -10,6 +10,35 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// NewIsolatedTestStoreEmpty opens a store against an EXISTING isolated
+// schema and runs the migration without dropping/recreating it. It is
+// used by the in-place migration test, which first seeds the legacy
+// schema by hand and then upgrades through the real Migrate path.
+func NewIsolatedTestStoreEmpty(t *testing.T, dsn, schema string) *Store {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &Store{pool: pool}
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
 // NewIsolatedTestStore is a test-only helper (kept out of _test.go so the
 // httpapi package's tests can use it) that creates an isolated schema,
 // runs the migration into it and drops the schema on test cleanup.

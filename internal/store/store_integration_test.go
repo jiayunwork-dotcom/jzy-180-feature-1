@@ -84,9 +84,12 @@ func assertSnapshotsMatch(t *testing.T, got, want inspection.Snapshot) {
 	for i := range got.Batches {
 		a, b := got.Batches[i], want.Batches[i]
 		if a.BatchID != b.BatchID || a.Severity != b.Severity ||
-			a.PlanID != b.PlanID || a.Decision != b.Decision ||
+			a.PlanID != b.PlanID || a.PlanName != b.PlanName ||
+			a.Decision != b.Decision ||
 			a.Accepted != b.Accepted || a.Score != b.Score ||
-			!a.At.Equal(b.At) || a.D1 != b.D1 {
+			!a.At.Equal(b.At) || a.D1 != b.D1 ||
+			(a.RevisionNo == nil) != (b.RevisionNo == nil) ||
+			(a.RevisionNo != nil && b.RevisionNo != nil && *a.RevisionNo != *b.RevisionNo) {
 			t.Fatalf("batch %d mismatch:\n got=%+v\nwant=%+v", i, a, b)
 		}
 	}
