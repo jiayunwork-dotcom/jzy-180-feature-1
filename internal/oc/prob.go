@@ -27,6 +27,14 @@ func expLog(l float64) float64 {
 // Evaluate returns acceptance probability (and the double-plan
 // decomposition) at defective fraction p.
 func Evaluate(pl *plan.Plan, p float64) Probabilities {
+	// Exact endpoints: every distribution has Pa(p=0)=1 and, while at
+	// least one defect is required to reject (c<n etc.), Pa(p=1)=0.
+	if p == 0 {
+		return Probabilities{Pa: 1, P1Acc: 1, P2: 0}
+	}
+	if p == 1 {
+		return Probabilities{Pa: 0, P1Rej: 1}
+	}
 	if pl.Kind == plan.KindSingle {
 		m := dist.NewModel(pl.Distribution, pl.SampleSize, pl.N, p)
 		return Probabilities{Pa: m.Cdf(pl.AcceptNumber)}

@@ -1,9 +1,13 @@
 package inspection
 
-import "sampling-svc/internal/plan"
+import (
+	"errors"
 
-// planFor returns the plan bound to the current severity slot.
-func (s *Stream) planFor(sev Severity) Ref {
+	"sampling-svc/internal/plan"
+)
+
+// slotFor returns the bound slot for the current severity.
+func (s *Stream) slotFor(sev Severity) Slot {
 	switch sev {
 	case SeverityTightened:
 		return s.Tightened
@@ -52,8 +56,9 @@ func applyResume(st State) State {
 
 // stepResult captures everything that happened while processing a batch.
 type stepResult struct {
-	outcome BatchOutcome
-	note    string
+	outcome  BatchOutcome
+	note     string
+	conflict *BatchConflict
 }
 
 // applyBatch advances the state by one lot. The incoming state is not
@@ -77,16 +82,30 @@ func applyBatch(st State, s *Stream, b *BatchInput) (State, stepResult) {
 		return st, res
 	}
 
-	ref := s.planFor(st.Severity)
-	pl := ref.Plan
+	slot := s.slotFor(st.Severity)
+	rev := slot.At(b.At)
+	pl := rev.Plan
 	res.outcome.Severity = st.Severity
-	res.outcome.PlanID = ref.ID
+	res.outcome.PlanID = slot.ID
+	res.outcome.PlanRevision = rev.Number
 	res.outcome.PlanName = pl.Name
 
 	accepted, err := LotDecision(pl, b.D1, b.HasD2, b.D2)
 	if err != nil {
-		// Caller validates before replay; keep the stream defensible.
+		// The lot cannot be judged under the revision effective at its
+		// inspection time. Report the conflict; use a deterministic
+		// rejected fallback so the walk can continue and surface every
+		// subsequent conflict in the same run.
 		accepted = false
+		field, msg := "d1", err.Error()
+		var fe plan.FieldError
+		if errors.As(err, &fe) {
+			field, msg = fe.Field, fe.Message
+		}
+		res.conflict = &BatchConflict{
+			BatchID: b.ID, LotNo: b.LotNo, Severity: st.Severity,
+			Revision: rev.Number, Field: field, Message: msg,
+		}
 		res.note = err.Error()
 	}
 	res.outcome.Accepted = accepted
@@ -175,38 +194,64 @@ func rejectsInWindow(w []bool) int {
 	return r
 }
 
-// validateBatch checks a recorded lot against every plan bound to the
-// stream, since backdated data may be judged under any severity slot.
+// validateBatch checks a recorded lot against every revision of every
+// plan bound to the stream, since backdated data may be judged under any
+// severity slot and any historical revision. A lot that is impossible to
+// judge under even one revision is rejected so the derived state can
+// never silently diverge from replay.
 func validateBatch(s *Stream, b *BatchInput) error {
-	for _, ref := range []Ref{s.Normal, s.Tightened, s.Reduced} {
-		if ref.Plan == nil {
-			continue
-		}
-		pl := ref.Plan
-		if pl.Kind == plan.KindSingle {
-			if b.HasD2 {
-				return fieldErr("d2", "not allowed for a single-sampling plan")
+	for _, slot := range []Slot{s.Normal, s.Tightened, s.Reduced} {
+		seen := map[*plan.Plan]bool{}
+		for _, rev := range slot.Revisions {
+			if rev.Plan == nil || seen[rev.Plan] {
+				continue
 			}
-			if b.D1 < 0 || b.D1 > pl.SampleSize {
-				return fieldErr("d1", "must be within [0,n]")
+			seen[rev.Plan] = true
+			if err := validateBatchAgainst(rev.Plan, b); err != nil {
+				return err
 			}
-			continue
-		}
-		if b.D1 < 0 || b.D1 > pl.N1 {
-			return fieldErr("d1", "must be within [0,n1]")
-		}
-		if b.HasD2 {
-			if b.D2 < 0 || b.D2 > pl.N2 {
-				return fieldErr("d2", "must be within [0,n2]")
-			}
-			if b.D1+b.D2 > pl.N1+pl.N2 {
-				return fieldErr("d2", "d1+d2 must be within [0,n1+n2]")
-			}
-		} else if b.D1 > pl.C1 && b.D1 < pl.R1 {
-			return fieldErr("d2", "required when c1 < d1 < r1")
 		}
 	}
 	return nil
+}
+
+// validateBatchAgainst checks one lot against one concrete plan.
+func validateBatchAgainst(pl *plan.Plan, b *BatchInput) error {
+	if pl.Kind == plan.KindSingle {
+		if b.HasD2 {
+			return fieldErr("d2", "not allowed for a single-sampling plan")
+		}
+		if b.D1 < 0 || b.D1 > pl.SampleSize {
+			return fieldErr("d1", "must be within [0,n]")
+		}
+		return nil
+	}
+	if b.D1 < 0 || b.D1 > pl.N1 {
+		return fieldErr("d1", "must be within [0,n1]")
+	}
+	if b.HasD2 {
+		if b.D2 < 0 || b.D2 > pl.N2 {
+			return fieldErr("d2", "must be within [0,n2]")
+		}
+		if b.D1+b.D2 > pl.N1+pl.N2 {
+			return fieldErr("d2", "d1+d2 must be within [0,n1+n2]")
+		}
+	} else if b.D1 > pl.C1 && b.D1 < pl.R1 {
+		return fieldErr("d2", "required when c1 < d1 < r1")
+	}
+	return nil
+}
+
+// BatchConflict identifies one recorded lot that a candidate revision
+// history could no longer judge.
+type BatchConflict struct {
+	StreamID string
+	BatchID  string
+	LotNo    string
+	Severity Severity
+	Revision int
+	Field    string
+	Message  string
 }
 
 type vfe struct{ f, m string }

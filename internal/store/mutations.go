@@ -40,7 +40,7 @@ func (s *Store) AddBatch(ctx context.Context, streamID string, b BatchRecord) (i
 		if err := insertBatchEvent(ctx, tx, streamID, seq, in); err != nil {
 			return err
 		}
-		snap, err = rebuildStream(ctx, tx, streamID)
+		snap, err = rebuildChecked(ctx, tx, streamID)
 		return err
 	})
 	return snap, mapWriteErr(err)
@@ -77,7 +77,7 @@ WHERE stream_id=$1 AND batch_id=$2 AND kind='batch'`,
 		if tag.RowsAffected() == 0 {
 			return ErrNotFound
 		}
-		snap, err = rebuildStream(ctx, tx, streamID)
+		snap, err = rebuildChecked(ctx, tx, streamID)
 		return err
 	})
 	return snap, mapWriteErr(err)

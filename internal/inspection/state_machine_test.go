@@ -20,9 +20,9 @@ func testStream(n, c int) *Stream {
 	return &Stream{
 		ID:        "s1",
 		Name:      "s",
-		Normal:    Ref{ID: "n", Plan: pn},
-		Tightened: Ref{ID: "t", Plan: pt},
-		Reduced:   Ref{ID: "r", Plan: pr},
+		Normal:    SingleSlot("n", pn),
+		Tightened: SingleSlot("t", pt),
+		Reduced:   SingleSlot("r", pr),
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"hash/fnv"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -63,14 +62,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
 // lockStream takes a transaction-scoped advisory lock derived from the
-// stream id. Advisory locks never conflict between different streams and
-// are released automatically at COMMIT/ROLLBACK.
+// stream id (namespace lockNSStream, distinct from plan locks). Advisory
+// locks never conflict between different streams and are released
+// automatically at COMMIT/ROLLBACK.
 func lockStream(ctx context.Context, tx pgx.Tx, streamID string) error {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(streamID))
-	key := int64(h.Sum64())
-	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", key)
-	return err
+	return lockKey(ctx, tx, advisoryKey(lockNSStream, streamID))
 }
 
 // runTx executes fn in a transaction.

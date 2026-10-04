@@ -11,12 +11,12 @@ import (
 )
 
 func doubleTestStream() *Stream {
-	mk := func(id, name string, c1, r1, c2 int) Ref {
-		return Ref{ID: id, Plan: &plan.Plan{
+	mk := func(id, name string, c1, r1, c2 int) Slot {
+		return SingleSlot(id, &plan.Plan{
 			ID: id, Name: name, Kind: plan.KindDouble,
 			Distribution: plan.DistBinomial,
 			N1:           10, C1: c1, R1: r1, N2: 10, C2: c2,
-		}}
+		})
 	}
 	return &Stream{
 		ID:        "d1",

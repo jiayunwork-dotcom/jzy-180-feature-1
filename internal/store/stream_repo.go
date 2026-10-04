@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"sampling-svc/internal/inspection"
 	"sampling-svc/internal/plan"
@@ -35,37 +36,62 @@ type BatchRecord struct {
 // CreateStream inserts a stream after verifying the three bound plans
 // exist and share one sampling kind (so every recorded lot is judged by
 // structurally identical rules across severity tracks).
+//
+// The transaction takes the plan advisory lock of every bound plan: this
+// serializes stream creation against a revision append, so an append that
+// read the bound set before the new stream existed cannot commit before
+// the binding (or vice versa) — every bound stream is always rebuilt.
 func (s *Store) CreateStream(ctx context.Context, rec StreamRecord) error {
-	plans := make(map[string]*plan.Plan, 3)
-	for _, pid := range []string{rec.NormalID, rec.TightenedID, rec.ReducedID} {
-		p, err := s.GetPlan(ctx, pid)
-		if err != nil {
+	return s.runTx(ctx, func(tx pgx.Tx) error {
+		keys := []int64{
+			advisoryKey(lockNSPlan, rec.NormalID),
+			advisoryKey(lockNSPlan, rec.TightenedID),
+			advisoryKey(lockNSPlan, rec.ReducedID),
+		}
+		if err := lockMany(ctx, tx, keys); err != nil {
 			return err
 		}
-		plans[pid] = p
-	}
-	kinds := map[plan.Kind]bool{
-		plans[rec.NormalID].Kind: true,
-	}
-	if !kinds[plans[rec.TightenedID].Kind] || !kinds[plans[rec.ReducedID].Kind] {
-		return ErrConflict{Msg: "normal/tightened/reduced plans must all be single or all be double sampling"}
-	}
-	_, err := s.pool.Exec(ctx, `
+		plans := make(map[string]*plan.Plan, 3)
+		for _, pid := range []string{rec.NormalID, rec.TightenedID, rec.ReducedID} {
+			p, err := loadPlan(ctx, tx, pid)
+			if err != nil {
+				return err
+			}
+			plans[pid] = p
+		}
+		kinds := map[plan.Kind]bool{
+			plans[rec.NormalID].Kind: true,
+		}
+		if !kinds[plans[rec.TightenedID].Kind] || !kinds[plans[rec.ReducedID].Kind] {
+			return ErrConflict{Msg: "normal/tightened/reduced plans must all be single or all be double sampling"}
+		}
+		_, err := tx.Exec(ctx, `
 INSERT INTO streams (id, name, normal_id, tightened_id, reduced_id)
 VALUES ($1,$2,$3,$4,$5)`,
-		rec.ID, rec.Name, rec.NormalID, rec.TightenedID, rec.ReducedID)
-	if isUniqueViolation(err) {
-		return ErrConflict{Msg: "stream name already exists: " + rec.Name}
-	}
-	if isFKViolation(err) {
-		return ErrNotFound
-	}
-	return err
+			rec.ID, rec.Name, rec.NormalID, rec.TightenedID, rec.ReducedID)
+		if isUniqueViolation(err) {
+			return ErrConflict{Msg: "stream name already exists: " + rec.Name}
+		}
+		if isFKViolation(err) {
+			return ErrNotFound
+		}
+		return err
+	})
 }
 
-// DeleteStream removes a stream and (cascade) all its events/results.
+// DeleteStream removes a stream and (cascade) all its events/results. It
+// takes the stream advisory lock so it cannot run interleaved with a
+// revision append that is rebuilding this very stream.
 func (s *Store) DeleteStream(ctx context.Context, id string) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM streams WHERE id=$1`, id)
+	var tag pgconn.CommandTag
+	err := s.runTx(ctx, func(tx pgx.Tx) error {
+		if err := lockStream(ctx, tx, id); err != nil {
+			return err
+		}
+		var e error
+		tag, e = tx.Exec(ctx, `DELETE FROM streams WHERE id=$1`, id)
+		return e
+	})
 	if err != nil {
 		return err
 	}
@@ -99,9 +125,17 @@ FROM streams ORDER BY name`)
 	return out, rows.Err()
 }
 
-// loadDomainStream loads a stream header plus its three plans and builds
-// the replay domain object.
+// loadDomainStream loads a stream header plus the complete revision
+// histories of its three plans and builds the replay domain object.
 func loadDomainStream(ctx context.Context, q ctxQuerier, id string) (*inspection.Stream, *StreamRecord, error) {
+	return loadDomainStreamWithCandidate(ctx, q, id, plan.Revision{})
+}
+
+// loadDomainStreamWithCandidate is like loadDomainStream but, when extra
+// is a non-zero revision for one of the bound plans, injects it into that
+// slot's history so the replay sees the candidate (dry-run conflict
+// check before the revision row exists).
+func loadDomainStreamWithCandidate(ctx context.Context, q ctxQuerier, id string, extra plan.Revision) (*inspection.Stream, *StreamRecord, error) {
 	var rec StreamRecord
 	var sev string
 	err := q.QueryRow(ctx, `
@@ -118,22 +152,29 @@ FROM streams WHERE id=$1`, id).Scan(
 	}
 	rec.CurrentSeverity = inspection.Severity(sev)
 
-	ref := func(pid string) (inspection.Ref, error) {
-		p, err := loadPlan(ctx, q, pid)
+	loadSlot := func(pid string) (inspection.Slot, error) {
+		slot, err := loadSlotTx(ctx, q, pid)
 		if err != nil {
-			return inspection.Ref{}, err
+			return inspection.Slot{}, err
 		}
-		return inspection.Ref{ID: pid, Plan: p}, nil
+		if extra.Plan != nil && extra.PlanID == pid {
+			p := *extra.Plan
+			p.ID = pid
+			slot.Revisions = append(slot.Revisions, inspection.RevisionRef{
+				Number: extra.Number, EffectiveAt: extra.EffectiveAt, Plan: &p,
+			})
+		}
+		return slot, nil
 	}
-	normal, err := ref(rec.NormalID)
+	normal, err := loadSlot(rec.NormalID)
 	if err != nil {
 		return nil, nil, err
 	}
-	tight, err := ref(rec.TightenedID)
+	tight, err := loadSlot(rec.TightenedID)
 	if err != nil {
 		return nil, nil, err
 	}
-	reduced, err := ref(rec.ReducedID)
+	reduced, err := loadSlot(rec.ReducedID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -141,6 +182,26 @@ FROM streams WHERE id=$1`, id).Scan(
 		ID: id, Name: rec.Name,
 		Normal: normal, Tightened: tight, Reduced: reduced,
 	}, &rec, nil
+}
+
+// loadSlotTx loads a slot and stamps the plan kind onto every revision.
+func loadSlotTx(ctx context.Context, q ctxQuerier, pid string) (inspection.Slot, error) {
+	kind, err := planKind(ctx, q, pid)
+	if err != nil {
+		return inspection.Slot{}, err
+	}
+	revs, err := loadRevisions(ctx, q, pid)
+	if err != nil {
+		return inspection.Slot{}, err
+	}
+	refs := make([]inspection.RevisionRef, 0, len(revs))
+	for _, rv := range revs {
+		rv.Plan.Kind = kind
+		refs = append(refs, inspection.RevisionRef{
+			Number: rv.Number, EffectiveAt: rv.EffectiveAt, Plan: rv.Plan,
+		})
+	}
+	return inspection.Slot{ID: pid, Revisions: refs}, nil
 }
 
 // loadEvents reads every event in deterministic (at, seq) order.
@@ -217,27 +278,66 @@ func derefBool(b *bool) bool {
 // rebuildStream replays the full event history inside tx and atomically
 // replaces the derived batch_results and current-state columns.
 func rebuildStream(ctx context.Context, tx pgx.Tx, streamID string) (inspection.Snapshot, error) {
-	dm, _, err := loadDomainStream(ctx, tx, streamID)
+	snap, _, err := rebuildStreamDiagnose(ctx, tx, streamID, false)
+	return snap, err
+}
+
+// rebuildChecked additionally fails the transaction when the resulting
+// timeline contains lots the current revisions cannot judge. Used by
+// batch add/update so a never-judgeable lot is rejected rather than
+// silently rendered accepted/rejected.
+func rebuildChecked(ctx context.Context, tx pgx.Tx, streamID string) (inspection.Snapshot, error) {
+	snap, conflicts, err := rebuildStreamDiagnose(ctx, tx, streamID, true)
 	if err != nil {
 		return inspection.Snapshot{}, err
+	}
+	if len(conflicts) > 0 {
+		cf := conflicts[0]
+		return inspection.Snapshot{}, plan.FieldError{
+			Field: cf.Field, Message: cf.Message,
+		}
+	}
+	return snap, nil
+}
+
+// rebuildStreamDiagnose is the shared rebuild core. When diagnose is set
+// the diagnostic replay is used and the conflicts are returned (the
+// derived rows are still written, letting the caller roll back after
+// examining them).
+func rebuildStreamDiagnose(ctx context.Context, tx pgx.Tx, streamID string, diagnose bool) (inspection.Snapshot, []inspection.BatchConflict, error) {
+	dm, _, err := loadDomainStream(ctx, tx, streamID)
+	if err != nil {
+		return inspection.Snapshot{}, nil, err
 	}
 	events, err := loadEvents(ctx, tx, streamID)
 	if err != nil {
-		return inspection.Snapshot{}, err
+		return inspection.Snapshot{}, nil, err
 	}
-	snap, err := inspection.Replay(dm, events)
+	var snap inspection.Snapshot
+	var conflicts []inspection.BatchConflict
+	if diagnose {
+		snap, conflicts, err = inspection.ReplayDiagnose(dm, events)
+	} else {
+		snap, err = inspection.Replay(dm, events)
+	}
 	if err != nil {
-		return inspection.Snapshot{}, err
+		return inspection.Snapshot{}, nil, err
 	}
+	if err := writeOutcomes(ctx, tx, streamID, events, snap); err != nil {
+		return inspection.Snapshot{}, nil, err
+	}
+	return snap, conflicts, nil
+}
 
+// writeOutcomes replaces batch_results and updates the current-state
+// columns from a freshly replayed snapshot.
+func writeOutcomes(ctx context.Context, tx pgx.Tx, streamID string, events []inspection.Event, snap inspection.Snapshot) error {
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM batch_results WHERE stream_id=$1`, streamID); err != nil {
-		return inspection.Snapshot{}, err
+		return err
 	}
 	if len(snap.Batches) > 0 {
 		batch := &pgx.Batch{}
-		// outcomes are already in replay (at, seq) order; seq allocation
-		// order is stored alongside so the row key stays stable.
 		seqByID := make(map[string]int64, len(events))
 		for _, ev := range events {
 			if ev.Batch != nil {
@@ -251,28 +351,26 @@ func rebuildStream(ctx context.Context, tx pgx.Tx, streamID string) (inspection.
 				d2 = *o.D2
 			}
 			batch.Queue(`INSERT INTO batch_results
-(stream_id, seq, batch_id, lot_no, at, severity, plan_id, plan_name,
- decision, accepted, d1, d2, score, note)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+(stream_id, seq, batch_id, lot_no, at, severity, plan_id, plan_revision,
+ plan_name, decision, accepted, d1, d2, score, note)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 				streamID, seqByID[o.BatchID], o.BatchID, o.LotNo, o.At,
-				string(o.Severity), o.PlanID, o.PlanName, string(o.Decision),
-				o.Accepted, o.D1, d2, o.Score, o.Note)
+				string(o.Severity), o.PlanID, o.PlanRevision, o.PlanName,
+				string(o.Decision), o.Accepted, o.D1, d2, o.Score, o.Note)
 		}
 		br := tx.SendBatch(ctx, batch)
 		for range snap.Batches {
 			if _, err := br.Exec(); err != nil {
 				br.Close()
-				return inspection.Snapshot{}, err
+				return err
 			}
 		}
 		br.Close()
 	}
-	if _, err := tx.Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 UPDATE streams SET current_severity=$2, current_score=$3, updated_at=now()
-WHERE id=$1`, streamID, string(snap.Current.Severity), snap.Current.ScoreValue()); err != nil {
-		return inspection.Snapshot{}, err
-	}
-	return snap, nil
+WHERE id=$1`, streamID, string(snap.Current.Severity), snap.Current.ScoreValue())
+	return err
 }
 
 // GetSnapshot returns current state and ordered per-batch outcomes from
@@ -282,16 +380,32 @@ func (s *Store) GetSnapshot(ctx context.Context, streamID string) (inspection.Sn
 	if err != nil {
 		return inspection.Snapshot{}, err
 	}
-	rows, err := s.pool.Query(ctx, `
-SELECT batch_id, lot_no, at, severity, plan_id, plan_name, decision,
-       accepted, d1, d2, score, note
-FROM batch_results WHERE stream_id=$1
-ORDER BY at ASC, seq ASC`, streamID)
+	outcomes, err := loadOutcomes(ctx, s.pool, streamID)
 	if err != nil {
 		return inspection.Snapshot{}, err
 	}
+	return inspection.Snapshot{
+		StreamID: streamID,
+		Current:  inspection.StateFrom(rec.CurrentSeverity, rec.CurrentScore),
+		Batches:  outcomes,
+	}, nil
+}
+
+// outcomeColumns is the per-batch derived projection shared by reads.
+const outcomeColumns = `batch_id, lot_no, at, severity, plan_id, plan_revision,
+       plan_name, decision, accepted, d1, d2, score, note`
+
+// loadOutcomes reads derived batch outcomes in (at, seq) order.
+func loadOutcomes(ctx context.Context, q ctxQuerier, streamID string) ([]inspection.BatchOutcome, error) {
+	rows, err := q.Query(ctx, `
+SELECT `+outcomeColumns+`
+FROM batch_results WHERE stream_id=$1
+ORDER BY at ASC, seq ASC`, streamID)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
-	snap := inspection.Snapshot{StreamID: streamID}
+	var out []inspection.BatchOutcome
 	for rows.Next() {
 		var (
 			o                                   inspection.BatchOutcome
@@ -300,9 +414,9 @@ ORDER BY at ASC, seq ASC`, streamID)
 			d2                                  *int
 			note                                string
 		)
-		if err := rows.Scan(&bid, &lot, &at, &sev, &pid, &pname,
-			&decision, &o.Accepted, &o.D1, &d2, &o.Score, &note); err != nil {
-			return inspection.Snapshot{}, err
+		if err := rows.Scan(&bid, &lot, &at, &sev, &pid, &o.PlanRevision,
+			&pname, &decision, &o.Accepted, &o.D1, &d2, &o.Score, &note); err != nil {
+			return nil, err
 		}
 		o.BatchID, o.LotNo, o.At = bid, lot, at
 		o.Severity = inspection.Severity(sev)
@@ -310,13 +424,9 @@ ORDER BY at ASC, seq ASC`, streamID)
 		o.Decision = inspection.Decision(decision)
 		o.D2 = d2
 		o.Note = note
-		snap.Batches = append(snap.Batches, o)
+		out = append(out, o)
 	}
-	if err := rows.Err(); err != nil {
-		return inspection.Snapshot{}, err
-	}
-	snap.Current = inspection.StateFrom(rec.CurrentSeverity, rec.CurrentScore)
-	return snap, nil
+	return out, rows.Err()
 }
 
 func (s *Store) loadStream(ctx context.Context, id string) (*inspection.Stream, *StreamRecord, error) {

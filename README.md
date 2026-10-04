@@ -2,10 +2,10 @@
 
 Go 1.23 + Echo + PostgreSQL 16 的纯 HTTP 后端，覆盖：
 
-- **方案档管理**：一次 / 二次抽样档的新建、修改、删除、按名查询。
+- **方案档管理**：一次 / 二次抽样档的新建、修改、删除、按名查询。方案档**带不可变修订历史**：每次修改追加一个带修订号与生效时刻的修订，生效时刻可在将来也可补记到过去；检验流按每批自身检验时间点上生效的修订判定。
 - **统计计算**：接收概率 Pa、二次抽样 ASN、带批量 N 时的 AOQ / AOQL / ATI、生产方风险 α 与使用方风险 β、OC 曲线。
 - **反向设计**：按 (AQL, α, LTPD, β) 搜索最小样本量一次方案；二次方案限定 n2=n1 或 n2=2·n1，在可行方案中取 AQL 处 ASN 最小者。
-- **检验流**：一条流绑定正常 / 加严 / 放宽三个档，逐批录入，按 GB/T 2828.1 转移规则推进严格度；补录、删改后逐字段与“从头重放”一致。
+- **检验流**：一条流绑定正常 / 加严 / 放宽三个档，逐批录入，按 GB/T 2828.1 转移规则推进严格度；补录、删改、追加修订后逐字段与“拿全部事件 + 全部修订从头重放”一致。
 
 只提供 HTTP/JSON 接口，无前端。
 
@@ -101,7 +101,32 @@ n 可行 ⇔ `cMin(n) ≤ cMax(n)`，该谓词随 n 单调，故用二分找最�
   - c ≥ 2：d ≤ c−2 加 3、d = c−1 加 2、d = c 加 1。
   - 二次抽样：一阶段接收按 c1、二阶段接收按合计 c2 查同一表。
 
-每条批次记录都带：当时严格度 `severity`、所用方案 `plan_id/plan_name`、判定 `decision/accepted`、转移后 `score`、转移说明 `note`。
+每条批次记录都带：当时严格度 `severity`、所用方案 `plan_id/plan_name`、**生效修订号 `plan_revision`**、判定 `decision/accepted`、转移后 `score`、转移说明 `note`。
+
+---
+
+## 4b. 方案修订历史
+
+方案档不再只存一份“当前值”。`plan_revisions` 为每个方案保存**不可变**的修订行；`plans` 上的数值列只是“最新（生效时刻最晚）修订”的便利副本，供分析 / 查询接口使用。
+
+- **修订**：每次改档 `POST /plans/{id}/revisions` 追加一行，有按追加顺序分配的 `revision_no` 与 `effective_at`。已落库的修订永不修改、永不删除；纠正只能再追加。
+- **生效解析**：判某一批时，其所在严格度槽位取 `effective_at <= 检验时刻` 中最大的修订；**生效时刻恰好等于检验时刻按新修订算**，同一生效时刻再按修订号大者优先。因此修订可以生效在将来，也可以补记到过去、插在两个已有修订之间。
+- **转移得分延续**：加分表只依赖“该批实际使用的那个修订”的接收数 c。正常检验中途换修订，得分按现有规则自然延续（c=2 的 d=0 加 3，换成 c=1 后同一段继续累计、d=0 改加 2），不引入任何特例。
+- **不能判的修订被拒绝**：追加前用候选修订历史对每条绑定流做一次**诊断重放**。样本量改小后某批不合格数超出新样本量等情形会逐批收集为冲突（含流、批号、严格度、修订号、字段与原因），整体回滚（HTTP 422），绝不悄悄当作接收 / 拒收。
+- **旧客户端兼容**：`PUT /plans/{id}` 语义改为“追加一个即刻生效的新修订”，不带 `effective_at` 也不报错；它不再覆盖此前的历史。
+
+### 为什么重算放在追加修订的同一事务里（同步）
+
+**结论：追加修订 + 锁定受影响流 + 逐条整流重放，全部在同一个数据库事务内提交。**
+
+- **任何时刻读到的流都是自洽的**：提交前读者只看到旧修订历史与旧派生结果；提交后一次性看到新修订与全部已按它重算好的结果。不存在“新旧修订混着判的半成品”，也不需要“尚未追上”的中间标记、追赶任务状态和差异暂存。
+- **差异直接随操作返回**：重放前先读旧 `batch_results`，与新结果逐批比对生成差异（严格度 / 判定 / 得分 / 所用修订的 from→to），追加接口同步返回；一批没变也会列出该流且 `batches` 为空数组，明确表示“没有变化”。
+- **排队与死锁**：事务先取方案锁，再取**该方案绑定的每条流**的咨询锁，所有键按全局升序获取；录批事务只持单条流锁。双方因而只会按同一顺序等待，**不可能成环死锁**。同一流的录批与改档串行；不同流仍互不阻塞。新建 / 删除流同样取相关方案锁，避免“刚绑定的流漏算”。
+- **代价**：一个档挂着多条很长的流时，一次改档要在一个事务里占住这些流并重放（O(总批数)）。这是用可预期的写放大换取“读到即一致”的硬保证；单流数千批的常规规模下为毫秒级。若将来单档挂数万条长流，可再演进为“快照表 + 有序追赶”的异步方案，但那必须引入可见性屏障与补偿，本版不提前承担这层复杂度。
+
+### 原地升级（旧数据卷直接启动新版本）
+
+启动迁移（幂等）在旧库上：为每个已有方案插入**唯一一个覆盖全部历史的初始修订**（`revision_no=1`、生效于公元 1 年），并给 `batch_results` 补 `plan_revision` 列（默认 1）。因此升级后每条流的当前状态与每批的严格度 / 判定 / 得分**逐字段不变**；`INSERT ... WHERE NOT EXISTS` 保证反复重启既不重复生成修订也不再次改写数据。
 
 ---
 
@@ -127,10 +152,13 @@ n 可行 ⇔ `cMin(n) ≤ cMax(n)`，该谓词随 n 单调，故用二分找最�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/plans` | 新建（body 见下） |
-| PUT | `/plans/{id}` | 修改 |
-| DELETE | `/plans/{id}` | 删除（被流引用时 409） |
-| GET | `/plans/{id}` / `/plans/by-name/{name}` / `/plans` | 查询 |
+| POST | `/plans` | 新建（同时生成覆盖全部历史的初始修订；body 见下） |
+| PUT | `/plans/{id}` | **旧客户端兼容**：追加即刻生效的新修订（不再原地覆盖历史） |
+| DELETE | `/plans/{id}` | 删除（被流引用时 409；修订历史级联删除） |
+| GET | `/plans/{id}` / `/plans/by-name/{name}` / `/plans` | 查询（当前值 = 生效最晚的修订） |
+| POST | `/plans/{id}/revisions` | **追加修订**（可带 `effective_at`，缺省=现在；同步重算受影响流并返回差异） |
+| GET | `/plans/{id}/revisions` | 修订历史（按生效时刻、修订号排序） |
+| GET | `/plans/{id}/revisions/{number}` | 按修订号取一个修订（不存在 404，号非数字 400） |
 | POST | `/plans/{id}/evaluate` | 给定 `p[]` 算 Pa（二次带 ASN；带 N 带 AOQ/ATI） |
 | POST | `/plans/{id}/curve` | OC 等曲线，`p_min/p_max/points`（points ≤ 500） |
 | POST | `/plans/{id}/risks` | `{aql, ltpd}` → α、β、Pa(AQL)、Pa(LTPD) |
@@ -149,6 +177,53 @@ n 可行 ⇔ `cMin(n) ≤ cMax(n)`，该谓词随 n 单调，故用二分找最�
 { "name": "dbl", "kind": "double",
   "double": { "n1": 50, "c1": 2, "r1": 5, "n2": 50, "c2": 6 } }
 ```
+
+追加修订 body（与新建同形，多一个可选 `effective_at`；`name`/`kind` 可省略，分别沿用当前名与不可变的 kind）：
+
+```json
+{ "name": "n80c1", "kind": "single",
+  "single": { "n": 80, "c": 1 },
+  "effective_at": "2026-03-15T00:00:00Z" }
+```
+
+响应里 `streams[]` 是受影响流的差异；每批的变化形如：
+
+```json
+{ "stream_id": "...", "name": "...", "batches": [
+  { "batch_id": "B7", "lot_no": "B7", "inspected_at": "...",
+    "severity": { "from": "normal", "to": "tightened" },
+    "decision": { "from": "accepted", "to": "rejected" },
+    "score":    { "from": 6, "to": 0 },
+    "plan":     { "plan_id": "...", "from_revision": 1, "to_revision": 2 } } ] }
+```
+
+没有任何批变化时 `batches` 为 `[]`。修订使已录批次无法判定时返回 **422**：
+
+```json
+{ "error": "revision cannot judge one or more recorded batches",
+  "revision_no": 3,
+  "conflicts": [ { "stream_id": "...", "batch_id": "B9", "lot_no": "B9",
+                   "severity": "normal", "revision_no": 3,
+                   "field": "d1",
+                   "message": "defect count must be within [0, first sample size]" } ] }
+```
+
+### 手算例子：正常档 n=80、c=2 → c=1
+
+正常档在时刻 T 从 `n=80,c=2` 改为 `n=80,c=1`（生效时刻=T）。转移得分按 GB/T 2828.1 加分表（c≥2：d≤c−2 加 3、d=c−1 加 2、d=c 加 1；c=1：d=0 加 2、d=1 加 1；拒收清零）：
+
+| 批 | 检验时刻 | d | 生效修订 | 判定 | 得分 |
+| --- | --- | --- | --- | --- | --- |
+| a | T−4h | 0 | 1 (c=2) | 接收（d≤c−2） | 3 |
+| b | T−3h | 1 | 1 | 接收（d=c−1） | 5 |
+| c | T−2h | 2 | 1 | **接收（d=c）** | 6 |
+| d | T−1h | 0 | 1 | 接收 | 9 |
+| e | T+1h | 0 | 2 (c=1) | 接收 | 11 |
+| f | T+2h | 1 | 2 | 接收（d=1 加 1） | 12 |
+| g | T+3h | 2 | 2 | **拒收（c=1 时 d=2）** | 0 |
+| h | T+4h | 0 | 2 | 接收 | 2 |
+
+改档前 g 在 c=2 下本为接收；追加修订后它改为不接收，且流上的严格度 / 得分随之级联重算。该例子在 `internal/store/revision_integration_test.go::TestHandComputedC2ToC1` 中逐批断言。
 
 ### 反向设计
 
@@ -174,7 +249,7 @@ n 可行 ⇔ `cMin(n) ≤ cMax(n)`，该谓词随 n 单调，故用二分找最�
 
 ### 校验与错误
 
-`n<1`、`c<0`、`c≥n`、`p∉[0,1]`、`N<n`、`AQL≥LTPD`、`α/β∉(0,1)`、不合格数超过样本量等一律 `400`，响应形如：
+`n<1`、`c<0`、`c≥n`、`p∉[0,1]`、`N<n`、`AQL≥LTPD`、`α/β∉(0,1)`、不合格数超过样本量等一律 `400`；修订时间格式非法报 `effective_at`，修订号不存在返回 `404`、号非数字返回 `400`（字段 `revision_no`）；响应形如：
 
 ```json
 { "error": "validation error",
@@ -188,20 +263,23 @@ n 可行 ⇔ `cMin(n) ≤ cMax(n)`，该谓词随 n 单调，故用二分找最�
 ```
 cmd/server/main.go              引导：连接、迁移、启动 HTTP
 internal/
-  plan/                         方案档领域模型与字段级校验
+  plan/                         方案档领域模型、字段级校验、修订模型(plan.go, revision.go)
   dist/                         对数域组合数；二项/泊松/超几何(含条件二阶段)模型
     combinatorics.go  model.go
   oc/                           Pa/ASN(prob.go)、AOQ/AOQL/ATI(rectify.go)、风险与曲线(curve.go)
   design/                       一次(single.go)、二次(double.go)两点方案搜索
-  inspection/                   类型(types.go)、判定(decision.go)、转移得分(score.go)、
-                                状态机(state_machine.go)、历史重放(replay.go)
-  store/                        PG 连接/迁移/锁(store.go)、方案仓储、流与事件、变更重算
-  httpapi/                      Echo 路由与 plan/analyze/design/stream 四组 handler
+  inspection/                   类型与修订槽(types.go)、判定(decision.go)、转移得分(score.go)、
+                                状态机(state_machine.go)、历史/诊断重放(replay.go)
+  store/                        PG 连接/迁移/锁(store.go)、方案与修订仓储(plan_repo.go,
+                                revision_repo.go)、流与事件(stream_repo.go)、批变更(mutations.go)、
+                                追加修订+同步重算+差异(revision_mutations.go)
+  httpapi/                      Echo 路由与 plan/revision/analyze/design/stream 五组 handler
 ```
 
-状态机与重放逻辑分属 `state_machine.go` 与 `replay.go`，未挤进同一文件。
+状态机与重放分属 `state_machine.go` 与 `replay.go`；修订相关的仓储与事务单独放在
+`revision_repo.go` / `revision_mutations.go`，handler 在 `revision_handlers.go`，未挤进既有文件。
 
 ## 8. 测试
 
-- 纯逻辑：`make test-unit`（无需数据库）——端点精确性、c/n 单调性、超几何→二项收敛、二次退化逐位一致、ASN/ATI 区间、AOQL 上界、n=80/c=2 手算值、设计最优性（含 n−1 不可行、二次全空间暴力比对）、每种转移与暂停的构造序列、300 轮随机打乱补录 / 删改与从头重放逐字段比对。
-- 集成：设置 `PG_TEST_DSN` 后 `make test-int`（带 `-race`）——PG16 上的 CRUD、转移持久化、补录 / 修正 / 删除重算、暂停恢复、二次抽样判定，以及并发压测（同流 16×60 并发核对不丢批 / 不重号 / 状态一致，跨流不阻塞）、HTTP 端到端。
+- 纯逻辑：`make test-unit`（无需数据库）——端点精确性、c/n 单调性、超几何→二项收敛、二次退化逐位一致、ASN/ATI 区间、AOQL 上界、n=80/c=2 手算值、设计最优性（含 n−1 不可行、二次全空间暴力比对）、每种转移与暂停的构造序列、300 轮随机打乱补录 / 删改与从头重放逐字段比对，以及修订生效时刻边界（恰相等按新修订）、补记插在中间、换修订时得分延续、无法判定批的冲突收集。
+- 集成：设置 `PG_TEST_DSN` 后 `make test-int`（带 `-race`）——PG16 上的 CRUD、转移持久化、补录 / 修正 / 删除重算、暂停恢复、二次抽样判定；修订专项：n=80 c=2→c=1 手算逐批断言、**随机交错追加修订（含补到过去 / 插在中间）+ 补录 + 删批 + 改数后与从头重放一致且差异完全吻合**、多客户端同时追加修订 + 同时录批不丢修订 / 不丢批 / 不重复计分且每批修订号正确、样本量缩小的修订被 422 拒绝并逐批指出、旧 PUT 即刻生效且不改写历史、**旧表结构灌数后原地升级逐字段比对且反复重启不重复迁移**、HTTP 端到端；并发压测（同流 16×60 不丢批 / 不重号，跨流不阻塞）。

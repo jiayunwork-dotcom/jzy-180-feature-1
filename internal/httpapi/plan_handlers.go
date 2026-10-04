@@ -41,7 +41,7 @@ func (s *Server) updatePlan(c echo.Context) error {
 	}
 	p.ID = existing.ID
 	if err := s.store.UpdatePlan(c.Request().Context(), p); err != nil {
-		return domainError(c, err)
+		return revisionError(c, err)
 	}
 	return c.JSON(http.StatusOK, planToJSON(p))
 }

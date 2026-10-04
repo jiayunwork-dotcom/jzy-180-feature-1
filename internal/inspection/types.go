@@ -68,13 +68,81 @@ type Ref struct {
 	Plan *plan.Plan
 }
 
+// RevisionRef is one stored revision of the plan in a slot. The rows are
+// immutable; the slot carries the full revision history so replay can
+// pick, for each lot, the revision effective at that lot's inspection
+// time.
+type RevisionRef struct {
+	Number      int
+	EffectiveAt time.Time
+	Plan        *plan.Plan
+}
+
+// Slot is one severity track (normal/tightened/reduced) with the complete
+// revision history of the plan bound to it. Rows are expected in any
+// order; resolution sorts as needed.
+type Slot struct {
+	ID        string // bound plan id
+	Revisions []RevisionRef
+}
+
+// At returns the plan revision effective at time t: the revision with the
+// greatest EffectiveAt <= t; on an exact EffectiveAt tie the greater
+// revision number wins. There is always at least one revision (the
+// initial one covers all history), so At never returns nil for a valid
+// slot.
+func (s Slot) At(t time.Time) RevisionRef {
+	best := RevisionRef{Number: -1}
+	found := false
+	for _, r := range s.Revisions {
+		if r.EffectiveAt.After(t) {
+			continue
+		}
+		if !found ||
+			r.EffectiveAt.After(best.EffectiveAt) ||
+			(r.EffectiveAt.Equal(best.EffectiveAt) && r.Number > best.Number) {
+			best = r
+			found = true
+		}
+	}
+	return best
+}
+
+// Plan returns the latest (newest effective) revision's plan. It keeps
+// callers that need "the plan in this slot" independent of revision
+// ordering details.
+func (s Slot) Plan() *plan.Plan {
+	var best RevisionRef
+	found := false
+	for _, r := range s.Revisions {
+		if !found ||
+			r.EffectiveAt.After(best.EffectiveAt) ||
+			(r.EffectiveAt.Equal(best.EffectiveAt) && r.Number > best.Number) {
+			best, found = r, true
+		}
+	}
+	if !found {
+		return nil
+	}
+	return best.Plan
+}
+
+// SingleSlot builds a slot containing exactly one revision, covering all
+// history (effective at the Go zero time). Used by pure-logic tests and
+// as a convenience where revision history is irrelevant.
+func SingleSlot(id string, p *plan.Plan) Slot {
+	return Slot{ID: id, Revisions: []RevisionRef{{
+		Number: 1, EffectiveAt: plan.Epoch, Plan: p,
+	}}}
+}
+
 // Stream binds the three severity plans.
 type Stream struct {
 	ID        string
 	Name      string
-	Normal    Ref
-	Tightened Ref
-	Reduced   Ref
+	Normal    Slot
+	Tightened Slot
+	Reduced   Slot
 }
 
 // State is the stream state after replaying through some point.
@@ -96,18 +164,19 @@ type State struct {
 
 // BatchOutcome is the computed disposition attached to one batch record.
 type BatchOutcome struct {
-	BatchID  string    `json:"batch_id"`
-	LotNo    string    `json:"lot_no"`
-	At       time.Time `json:"inspected_at"`
-	Severity Severity  `json:"severity"`
-	PlanID   string    `json:"plan_id"`
-	PlanName string    `json:"plan_name"`
-	Decision Decision  `json:"decision"`
-	Accepted bool      `json:"accepted"`
-	D1       int       `json:"d1"`
-	D2       *int      `json:"d2,omitempty"`
-	Score    int       `json:"score"`
-	Note     string    `json:"note,omitempty"`
+	BatchID      string    `json:"batch_id"`
+	LotNo        string    `json:"lot_no"`
+	At           time.Time `json:"inspected_at"`
+	Severity     Severity  `json:"severity"`
+	PlanID       string    `json:"plan_id"`
+	PlanRevision int       `json:"plan_revision"`
+	PlanName     string    `json:"plan_name"`
+	Decision     Decision  `json:"decision"`
+	Accepted     bool      `json:"accepted"`
+	D1           int       `json:"d1"`
+	D2           *int      `json:"d2,omitempty"`
+	Score        int       `json:"score"`
+	Note         string    `json:"note,omitempty"`
 }
 
 // Snapshot is the current stream state plus every per-batch outcome.
